@@ -1,0 +1,1716 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="三十五中学生作品展示平台，上传内容经管理员审核后公开。">
+  <title>三十五中学生网 · 作品展示</title>
+  <link rel="icon" type="image/png" href="/logo.png?v=2">
+  <!--
+    三十五中学生网 · 服务端版
+    页面与接口都由同目录的 server.js 提供，前端不再使用 IndexedDB。
+
+    数据流
+    1. 学生上传：POST /api/items（body 为文件原始字节），文件落 data/files/<id>，元数据进 data/items.json
+    2. 管理端：GET /api/items?status=pending，再 approve / reject
+    3. 公开作品库：GET /api/items?status=passed，文件走 /files/<id>（支持 Range，视频可拖动进度条）
+    4. 管理员：POST /api/login，服务端 scrypt 校验，凭证放 HttpOnly Cookie
+
+    安全边界
+    - 类型白名单（JPG/PNG/WebP/GIF/AVIF、MP4/WebM/MOV），大小上限 20MB / 500MB
+    - 文件名、作者名长度校验；前端一律 textContent 渲染
+    - 磁盘文件名由服务端生成 UUID，不采用用户文件名，避免路径穿越
+    - 待审核文件仅管理员可读
+  -->
+  <style>
+    /* ===================== 基础变量 ===================== */
+    :root {
+      --bg-0: #05122b;
+      --bg-1: #0a2050;
+      --bg-2: #1b5384;
+      --card: rgba(255, 255, 255, 0.055);
+      --card-solid: rgba(9, 28, 62, 0.82);
+      --line: rgba(255, 255, 255, 0.11);
+      --ink: #eef5ff;
+      --muted: #a6c2e6;
+      --accent: #5aa9ff;
+      --accent-2: #3b82f6;
+      --ok: #10b981;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+      --radius: 16px;
+      --shadow: 0 18px 40px -22px rgba(0, 0, 0, 0.9);
+      --font: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: var(--font);
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+      background:
+        radial-gradient(900px 620px at 12% -10%, rgba(90, 169, 255, 0.20), transparent 62%),
+        radial-gradient(720px 520px at 100% 0%, rgba(16, 185, 129, 0.08), transparent 58%),
+        linear-gradient(165deg, var(--bg-0) 0%, var(--bg-1) 46%, var(--bg-2) 100%);
+      background-attachment: fixed;
+    }
+
+    img, video { max-width: 100%; }
+
+    /* 关键：.btn 等类设了 display，会盖掉浏览器对 [hidden] 的默认隐藏 */
+    [hidden] { display: none !important; }
+
+    a { color: #bfe0ff; }
+    a:hover { color: #fff; }
+
+    .wrap {
+      width: min(1120px, calc(100% - 2rem));
+      margin-inline: auto;
+    }
+
+    /* ===================== 头部 ===================== */
+    .site-header { padding: 2.4rem 0 1.1rem; text-align: center; }
+
+    .brand {
+      display: grid;
+      place-items: center;
+      width: 104px;
+      height: 104px;
+      margin-inline: auto;
+      border-radius: 50%;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.07);
+      box-shadow: 0 18px 36px -20px #000, inset 0 1px 0 rgba(255, 255, 255, 0.18);
+      overflow: hidden;
+    }
+
+    .brand-logo {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    .brand-fallback {
+      display: none;
+      place-items: center;
+      width: 100%;
+      height: 100%;
+      font-size: 1.9rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      color: #eaf4ff;
+      background: linear-gradient(150deg, #2f6fb8, #12406f);
+    }
+
+    .brand.no-logo .brand-logo { display: none; }
+    .brand.no-logo .brand-fallback { display: grid; }
+
+    /* 有校徽时去掉圆框底色，避免和校徽自带的白边叠成一圈 */
+    .brand.has-logo {
+      background: transparent;
+      border-color: transparent;
+      box-shadow: none;
+    }
+
+    .site-title {
+      margin: 1rem 0 0.25rem;
+      font-size: clamp(1.55rem, 4.2vw, 2.35rem);
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      text-shadow: 0 2px 18px rgba(0, 0, 0, 0.35);
+    }
+
+    .site-subtitle {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    /* ===================== 导航 ===================== */
+    .site-nav {
+      position: sticky;
+      top: 0;
+      z-index: 30;
+      background: rgba(7, 20, 44, 0.62);
+      border-block: 1px solid var(--line);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+    }
+
+    .site-nav .wrap {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 0.45rem;
+      padding: 0.55rem 0;
+    }
+
+    .nav-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.5rem 0.95rem;
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: 0.94rem;
+      text-decoration: none;
+      transition: color 0.18s, background 0.18s, box-shadow 0.18s;
+    }
+
+    .nav-link:hover { color: #fff; background: rgba(255, 255, 255, 0.07); }
+
+    .nav-link.active {
+      color: #fff;
+      background: rgba(90, 169, 255, 0.18);
+      box-shadow: inset 0 0 0 1px rgba(90, 169, 255, 0.45);
+    }
+
+    .nav-link:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .nav-count {
+      min-width: 1.4rem;
+      padding: 0.02rem 0.35rem;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.14);
+      font-size: 0.72rem;
+      font-variant-numeric: tabular-nums;
+      text-align: center;
+    }
+
+    /* ===================== 主体与分节 ===================== */
+    .site-main { padding: 2.2rem 0 3rem; }
+
+    .section { display: none; }
+
+    .section.active {
+      display: block;
+      animation: none;
+    }
+
+    @keyframes section-in {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: none; }
+    }
+
+    .home-stack { max-width: 880px; margin-inline: auto; }
+
+    .panel {
+      background: linear-gradient(180deg, rgba(20, 48, 94, 0.62), rgba(10, 27, 60, 0.74));
+      border: 1px solid rgba(255, 255, 255, 0.13);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+    }
+
+    .panel-pad { padding: 1.6rem; }
+
+    .panel-title {
+      margin: 0 0 0.35rem;
+      font-size: 1.22rem;
+      font-weight: 600;
+    }
+
+    .panel-hint {
+      margin: 0 0 1.15rem;
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    .section-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.9rem;
+      margin-bottom: 0.35rem;
+    }
+
+    .section-title {
+      margin: 0;
+      padding-left: 0.7rem;
+      border-left: 4px solid var(--accent);
+      font-size: 1.34rem;
+      font-weight: 600;
+      line-height: 1.3;
+    }
+
+    .section-tools {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.55rem;
+    }
+
+    .section-hint {
+      margin: 0.35rem 0 1rem;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    /* ===================== 存储告警 ===================== */
+    .alert {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 0.5rem;
+      margin-bottom: 1.2rem;
+      padding: 0.75rem 1rem;
+      border: 1px solid rgba(239, 68, 68, 0.45);
+      border-radius: 12px;
+      background: rgba(239, 68, 68, 0.12);
+      color: #ffd9d9;
+      font-size: 0.85rem;
+    }
+
+    .alert strong { color: #fff; }
+
+    /* ===================== 免责声明 ===================== */
+    .notice {
+      margin-bottom: 1.4rem;
+      border: 1px solid rgba(245, 158, 11, 0.3);
+      border-radius: 14px;
+      background: rgba(245, 158, 11, 0.075);
+      overflow: hidden;
+    }
+
+    .notice summary {
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      padding: 0.85rem 1.1rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
+    }
+
+    .notice summary::-webkit-details-marker { display: none; }
+
+    .notice summary::after {
+      content: "▾";
+      margin-left: auto;
+      color: var(--warn);
+      transition: transform 0.2s;
+    }
+
+    .notice[open] summary::after { transform: rotate(180deg); }
+
+    .notice summary:focus-visible {
+      outline: 2px solid var(--warn);
+      outline-offset: -2px;
+    }
+
+    .notice-body {
+      padding: 0 1.1rem 1rem;
+      color: #dbe8f8;
+      font-size: 0.86rem;
+      line-height: 1.75;
+    }
+
+    .notice-body p { margin: 0.3rem 0; }
+
+    .notice-contact {
+      margin-top: 0.7rem !important;
+      padding-top: 0.6rem;
+      border-top: 1px dashed rgba(255, 255, 255, 0.14);
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    /* ===================== 表单 ===================== */
+    .field { display: block; margin-bottom: 1rem; }
+
+    .field-label {
+      display: block;
+      margin-bottom: 0.35rem;
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    .input {
+      width: 100%;
+      padding: 0.68rem 0.85rem;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.07);
+      color: var(--ink);
+      font: inherit;
+      font-size: 0.94rem;
+      transition: border-color 0.18s, background 0.18s, box-shadow 0.18s;
+    }
+
+    .input::placeholder { color: rgba(166, 194, 230, 0.7); }
+
+    .input:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: rgba(255, 255, 255, 0.1);
+      box-shadow: 0 0 0 3px rgba(90, 169, 255, 0.22);
+    }
+
+    .input-search { width: 210px; }
+
+    /* ===================== 按钮 ===================== */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.4rem;
+      padding: 0.64rem 1.15rem;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      color: var(--ink);
+      font: inherit;
+      font-size: 0.94rem;
+      font-weight: 500;
+      text-decoration: none;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.18s, transform 0.12s, box-shadow 0.18s, opacity 0.18s;
+    }
+
+    .btn:active { transform: translateY(1px); }
+
+    .btn:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .btn-primary {
+      background: linear-gradient(180deg, #4f9dff, #2f7fe0);
+      color: #fff;
+      box-shadow: 0 12px 26px -14px rgba(59, 130, 246, 0.95);
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: linear-gradient(180deg, #63adff, #3a8bf0);
+    }
+
+    .btn-success { background: #0f9f70; color: #fff; }
+    .btn-success:hover:not(:disabled) { background: #12b380; }
+
+    .btn-warn { background: #d18c0c; color: #fff; }
+    .btn-warn:hover:not(:disabled) { background: #e59d16; }
+
+    .btn-danger { background: rgba(239, 68, 68, 0.92); color: #fff; }
+    .btn-danger:hover:not(:disabled) { background: #ef4444; }
+
+    .btn-ghost {
+      background: rgba(255, 255, 255, 0.08);
+      border-color: var(--line);
+    }
+
+    .btn-ghost:hover:not(:disabled) { background: rgba(255, 255, 255, 0.15); }
+
+    .btn-sm {
+      padding: 0.42rem 0.8rem;
+      border-radius: 9px;
+      font-size: 0.83rem;
+    }
+
+    /* ===================== 拖放区 ===================== */
+    .dropzone {
+      padding: 2rem 1rem;
+      border: 2px dashed rgba(255, 255, 255, 0.24);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.035);
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.18s, background 0.18s, box-shadow 0.18s;
+    }
+
+    .dropzone:hover,
+    .dropzone:focus-visible {
+      border-color: rgba(90, 169, 255, 0.75);
+      background: rgba(90, 169, 255, 0.1);
+      outline: none;
+      box-shadow: 0 0 0 3px rgba(90, 169, 255, 0.16);
+    }
+
+    .dropzone.is-drag {
+      border-style: solid;
+      border-color: var(--accent);
+      background: rgba(90, 169, 255, 0.16);
+    }
+
+    .dropzone-icon {
+      font-size: 1.6rem;
+      line-height: 1;
+      color: var(--accent);
+      margin-bottom: 0.5rem;
+    }
+
+    .dropzone-text { margin: 0; font-size: 0.95rem; }
+    .dropzone-text .link { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+    .dropzone-hint { margin: 0.4rem 0 0; color: var(--muted); font-size: 0.8rem; }
+
+    /* ===================== 待提交列表 ===================== */
+    .preview-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+      margin-top: 1rem;
+    }
+
+    .preview-row {
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+      padding: 0.55rem;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .preview-thumb {
+      flex: 0 0 auto;
+      width: 84px;
+      height: 56px;
+      border-radius: 8px;
+      background: #04101f;
+      overflow: hidden;
+    }
+
+    .preview-thumb img,
+    .preview-thumb video {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .preview-info { flex: 1; min-width: 0; }
+
+    .preview-name {
+      margin: 0;
+      font-size: 0.9rem;
+      font-weight: 500;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .preview-meta {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    .form-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.6rem;
+      margin-top: 1.1rem;
+    }
+
+    .form-note { color: var(--muted); font-size: 0.8rem; }
+
+    /* ===================== 作品卡片 ===================== */
+    .media-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+      gap: 1.15rem;
+    }
+
+    .media-card {
+      display: flex;
+      flex-direction: column;
+      background: var(--card-solid);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      transition: transform 0.22s, box-shadow 0.22s, border-color 0.22s;
+    }
+
+    .media-card:hover {
+      transform: translateY(-4px);
+      border-color: rgba(90, 169, 255, 0.45);
+      box-shadow: 0 26px 48px -24px #000;
+    }
+
+    .media-frame {
+      position: relative;
+      display: block;
+      aspect-ratio: 16 / 10;
+      background: #04122b;
+      overflow: hidden;
+      cursor: zoom-in;
+    }
+
+    .media-frame:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: -2px;
+    }
+
+    .media-frame img,
+    .media-frame video {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transition: transform 0.45s ease;
+    }
+
+    .media-card:hover .media-frame img { transform: scale(1.04); }
+
+    .play-hint {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      pointer-events: none;
+      background: linear-gradient(180deg, rgba(4, 18, 43, 0.02), rgba(4, 18, 43, 0.4));
+    }
+
+    .play-hint > span {
+      display: grid;
+      place-items: center;
+      width: 54px;
+      height: 54px;
+      border: 1px solid rgba(255, 255, 255, 0.38);
+      border-radius: 50%;
+      background: rgba(4, 18, 43, 0.55);
+      backdrop-filter: blur(4px);
+    }
+
+    .play-hint svg {
+      width: 22px;
+      height: 22px;
+      margin-left: 3px;
+      fill: #fff;
+    }
+
+    .badge {
+      position: absolute;
+      left: 10px;
+      bottom: 10px;
+      z-index: 2;
+      padding: 0.18rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      backdrop-filter: blur(6px);
+    }
+
+    .badge-passed { background: rgba(16, 185, 129, 0.94); color: #00301f; }
+    .badge-pending { background: rgba(245, 158, 11, 0.94); color: #3a2401; }
+
+    .icon-btn {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 3;
+      display: grid;
+      place-items: center;
+      width: 30px;
+      height: 30px;
+      padding: 0;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 9px;
+      background: rgba(8, 20, 45, 0.72);
+      color: #fff;
+      cursor: pointer;
+      backdrop-filter: blur(6px);
+      transition: background 0.18s, border-color 0.18s;
+    }
+
+    .icon-btn:hover { background: rgba(239, 68, 68, 0.95); border-color: transparent; }
+
+    .icon-btn:focus-visible {
+      outline: 2px solid #fff;
+      outline-offset: 2px;
+    }
+
+    .media-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 0.18rem;
+      padding: 0.8rem 0.95rem 0.95rem;
+      min-width: 0;
+    }
+
+    .media-name {
+      margin: 0;
+      font-size: 0.96rem;
+      font-weight: 600;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .media-sub {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.78rem;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .card-actions {
+      display: flex;
+      gap: 0.5rem;
+      padding: 0 0.95rem 1rem;
+    }
+
+    .card-actions .btn { flex: 1; }
+
+    /* ===================== 空状态 ===================== */
+    .empty {
+      grid-column: 1 / -1;
+      padding: 3rem 1.2rem;
+      border: 1px dashed var(--line);
+      border-radius: 14px;
+      color: var(--muted);
+      text-align: center;
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .empty strong {
+      display: block;
+      margin-bottom: 0.25rem;
+      color: var(--ink);
+      font-size: 1rem;
+      font-weight: 600;
+    }
+
+    .empty p { margin: 0; font-size: 0.84rem; }
+
+    /* ===================== 审核锁定 ===================== */
+    .locked {
+      padding: 2.2rem 1.2rem;
+      border: 1px dashed var(--line);
+      border-radius: 14px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 0.9rem;
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .locked p { margin: 0; }
+
+    /* ===================== 关于 ===================== */
+    .about { max-width: 760px; margin-inline: auto; }
+
+    .about-list {
+      display: grid;
+      gap: 0.55rem;
+      margin: 1rem 0;
+    }
+
+    .about-list > div {
+      display: grid;
+      grid-template-columns: 5.5rem 1fr;
+      gap: 0.8rem;
+      font-size: 0.92rem;
+    }
+
+    .about-list dt { color: var(--muted); }
+    .about-list dd { margin: 0; }
+
+    .about-note {
+      margin: 1.1rem 0 0;
+      padding-top: 0.9rem;
+      border-top: 1px dashed var(--line);
+      color: var(--muted);
+      font-size: 0.83rem;
+      line-height: 1.7;
+    }
+
+    /* ===================== 弹层 ===================== */
+    dialog.media-dialog {
+      width: min(1000px, 92vw);
+      max-width: 92vw;
+      max-height: 88vh;
+      padding: 0;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #0a1730;
+      color: var(--ink);
+      box-shadow: 0 40px 90px -30px #000;
+    }
+
+    dialog.media-dialog::backdrop {
+      background: rgba(3, 10, 24, 0.8);
+      backdrop-filter: blur(3px);
+    }
+
+    .dialog-head {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      padding: 0.8rem 1rem;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .dialog-title {
+      flex: 1;
+      min-width: 0;
+      margin: 0;
+      font-size: 0.9rem;
+      font-weight: 500;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .dialog-close {
+      flex: 0 0 auto;
+      display: grid;
+      place-items: center;
+      width: 30px;
+      height: 30px;
+      padding: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.06);
+      color: #fff;
+      font-size: 1rem;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    .dialog-close:hover { background: rgba(239, 68, 68, 0.9); }
+
+    .dialog-close:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .dialog-body {
+      display: grid;
+      place-items: center;
+      max-height: calc(88vh - 56px);
+      padding: 0.75rem;
+      background: #04101f;
+      overflow: auto;
+    }
+
+    .dialog-media {
+      display: block;
+      max-width: 100%;
+      max-height: calc(88vh - 110px);
+      border-radius: 8px;
+    }
+
+    /* ===================== Toast ===================== */
+    .toast-root {
+      position: fixed;
+      left: 50%;
+      bottom: 1.4rem;
+      z-index: 90;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.5rem;
+      width: min(92vw, 430px);
+      transform: translateX(-50%);
+      pointer-events: none;
+    }
+
+    .toast {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.55rem;
+      width: 100%;
+      padding: 0.68rem 0.95rem;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(9, 25, 55, 0.97);
+      box-shadow: 0 20px 42px -22px #000;
+      font-size: 0.88rem;
+      pointer-events: auto;
+      animation: toast-in 0.22s ease-out;
+    }
+
+    .toast.success { border-color: rgba(16, 185, 129, 0.65); }
+    .toast.error { border-color: rgba(239, 68, 68, 0.65); }
+    .toast.warn { border-color: rgba(245, 158, 11, 0.65); }
+
+    .toast-icon {
+      flex: 0 0 auto;
+      display: grid;
+      place-items: center;
+      width: 18px;
+      height: 18px;
+      margin-top: 0.15rem;
+      border-radius: 50%;
+      font-size: 0.7rem;
+      font-weight: 700;
+      color: #04101f;
+      background: var(--accent);
+    }
+
+    .toast.success .toast-icon { background: var(--ok); }
+    .toast.error .toast-icon { background: var(--danger); color: #fff; }
+    .toast.warn .toast-icon { background: var(--warn); color: #3a2401; }
+
+    .toast-text { flex: 1; min-width: 0; word-break: break-word; }
+
+    .toast.is-out { animation: toast-out 0.2s forwards; }
+
+    @keyframes toast-in {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: none; }
+    }
+
+    @keyframes toast-out {
+      to { opacity: 0; transform: translateY(6px); }
+    }
+
+    /* ===================== 页脚 ===================== */
+    .site-footer {
+      margin-top: 3rem;
+      padding: 1.5rem 0 2.2rem;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.8rem;
+      text-align: center;
+    }
+
+    .site-footer p { margin: 0.2rem 0; }
+
+    /* ===================== 首页横幅 ===================== */
+    .hero {
+      position: relative;
+      display: grid;
+      grid-template-columns: 1.05fr 1fr;
+      gap: 1.6rem;
+      align-items: center;
+      margin-bottom: 1.1rem;
+      padding: 1.5rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(180deg, rgba(20, 48, 94, 0.66), rgba(10, 27, 60, 0.78));
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .hero-media {
+      position: relative;
+      aspect-ratio: 16 / 10;
+      border-radius: 12px;
+      overflow: hidden;
+      background: #04122b;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .hero-media img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .hero-media::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(4, 18, 43, 0) 38%, rgba(4, 18, 43, 0.72));
+    }
+
+    .hero-kicker {
+      margin: 0 0 0.4rem;
+      color: var(--accent);
+      font-size: 0.74rem;
+      letter-spacing: 0.18em;
+    }
+
+    .hero-title {
+      margin: 0 0 0.55rem;
+      font-size: clamp(1.3rem, 2.5vw, 1.85rem);
+      font-weight: 700;
+      line-height: 1.3;
+    }
+
+    .hero-text {
+      margin: 0 0 1.1rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6rem;
+    }
+
+    /* ===================== 校园掠影 ===================== */
+    .campus-strip { margin-bottom: 1.4rem; }
+
+    .campus-strip figure {
+      position: relative;
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      overflow: hidden;
+      background: #04122b;
+    }
+
+    .campus-strip img {
+      display: block;
+      width: 100%;
+      aspect-ratio: 2 / 1;
+      object-fit: cover;
+      object-position: 50% 30%;
+      transition: transform 0.5s ease;
+    }
+
+    .campus-strip figure:hover img { transform: scale(1.03); }
+
+    .campus-strip figcaption {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      padding: 0.55rem 0.9rem;
+      color: #eaf2ff;
+      font-size: 0.78rem;
+      background: linear-gradient(180deg, rgba(4, 18, 43, 0), rgba(4, 18, 43, 0.85));
+    }
+
+    /* ===================== 论坛 ===================== */
+    .forum-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      margin-bottom: 1rem;
+    }
+
+    .forum-tab {
+      padding: 0.4rem 0.9rem;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--muted);
+      font: inherit;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: color 0.18s, background 0.18s, border-color 0.18s;
+    }
+
+    .forum-tab:hover { color: #fff; background: rgba(255, 255, 255, 0.12); }
+
+    .forum-tab.active {
+      color: #fff;
+      background: rgba(90, 169, 255, 0.2);
+      border-color: rgba(90, 169, 255, 0.55);
+    }
+
+    .forum-tab:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .forum-list {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(8, 26, 58, 0.55);
+      overflow: hidden;
+    }
+
+    .forum-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 9rem 8rem;
+      gap: 1rem;
+      align-items: center;
+      padding: 0.8rem 1rem;
+      border-top: 1px solid rgba(255, 255, 255, 0.07);
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .forum-row:first-child { border-top: 0; }
+    .forum-row:hover { background: rgba(90, 169, 255, 0.08); }
+
+    .forum-row:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: -2px;
+    }
+
+    .forum-row-main { min-width: 0; }
+
+    .forum-row-title {
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      margin: 0;
+      font-size: 0.95rem;
+      font-weight: 600;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .forum-row-preview {
+      margin: 0.18rem 0 0;
+      color: var(--muted);
+      font-size: 0.77rem;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .forum-row-meta {
+      color: var(--muted);
+      font-size: 0.77rem;
+      text-align: right;
+    }
+
+    .forum-row-stats {
+      display: flex;
+      justify-content: flex-end;
+      gap: 0.75rem;
+      color: var(--muted);
+      font-size: 0.77rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .forum-pin {
+      flex: 0 0 auto;
+      padding: 0.02rem 0.4rem;
+      border-radius: 999px;
+      background: rgba(245, 158, 11, 0.92);
+      color: #3a2401;
+      font-size: 0.66rem;
+      font-weight: 700;
+    }
+
+    .forum-tag {
+      flex: 0 0 auto;
+      padding: 0.02rem 0.45rem;
+      border-radius: 999px;
+      background: rgba(90, 169, 255, 0.16);
+      color: #bfe0ff;
+      font-size: 0.66rem;
+      font-weight: 500;
+    }
+
+    .forum-empty {
+      padding: 3rem 1rem;
+      color: var(--muted);
+      text-align: center;
+      font-size: 0.86rem;
+    }
+
+    .forum-pager {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.7rem;
+      margin-top: 1rem;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0 1rem;
+    }
+
+    textarea.input {
+      min-height: 6rem;
+      resize: vertical;
+      line-height: 1.7;
+    }
+
+    /* ===================== 帖子详情 ===================== */
+    .thread {
+      margin: 0.9rem 0 1.2rem;
+      padding: 1.3rem 1.4rem;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(8, 26, 58, 0.6);
+    }
+
+    .thread-title {
+      margin: 0 0 0.45rem;
+      font-size: 1.22rem;
+      font-weight: 700;
+      line-height: 1.4;
+      word-break: break-word;
+    }
+
+    .thread-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem 1rem;
+      margin: 0 0 1rem;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    .thread-body {
+      font-size: 0.95rem;
+      line-height: 1.85;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .thread-tools {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 1.1rem;
+      padding-top: 0.9rem;
+      border-top: 1px dashed var(--line);
+    }
+
+    .reply-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.7rem;
+      margin-bottom: 1.2rem;
+    }
+
+    .reply {
+      padding: 0.85rem 1rem;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .reply-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-bottom: 0.35rem;
+      color: var(--muted);
+      font-size: 0.76rem;
+    }
+
+    .reply-body {
+      font-size: 0.92rem;
+      line-height: 1.8;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .reply-actions {
+      margin-top: 0.45rem;
+      text-align: right;
+    }
+
+    /* ===================== 今日热点 ===================== */
+    .hot {
+      margin-bottom: 1.2rem;
+      padding: 1.2rem 1.25rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(180deg, rgba(20, 48, 94, 0.66), rgba(10, 27, 60, 0.78));
+      box-shadow: var(--shadow);
+    }
+
+    .hot-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 0.5rem 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .hot-title {
+      margin: 0;
+      padding-left: 0.6rem;
+      border-left: 4px solid var(--warn);
+      font-size: 1.12rem;
+      font-weight: 700;
+    }
+
+    .hot-sub { color: var(--muted); font-size: 0.76rem; }
+
+    .hot-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+
+    .hot-card {
+      min-width: 0;
+      padding: 0.9rem 1rem;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .hot-card-title {
+      margin: 0 0 0.6rem;
+      color: #dbe9ff;
+      font-size: 0.88rem;
+      font-weight: 600;
+    }
+
+    .hot-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .hot-list li {
+      display: flex;
+      align-items: baseline;
+      gap: 0.5rem;
+      min-width: 0;
+      font-size: 0.88rem;
+    }
+
+    .hot-list a {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      color: var(--ink);
+      text-decoration: none;
+    }
+
+    .hot-list a:hover { color: var(--accent); }
+
+    .hot-meta { flex: 0 0 auto; color: var(--muted); font-size: 0.74rem; }
+
+    .hot-media { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; }
+
+    .hot-thumb {
+      position: relative;
+      aspect-ratio: 1 / 1;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 8px;
+      background: #04122b;
+      overflow: hidden;
+      cursor: pointer;
+    }
+
+    .hot-thumb img,
+    .hot-thumb video {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .hot-thumb span {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      padding: 0.2rem 0.35rem;
+      color: #eaf2ff;
+      font-size: 0.64rem;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      background: linear-gradient(180deg, rgba(4, 18, 43, 0), rgba(4, 18, 43, 0.85));
+    }
+
+    .hot-empty { color: var(--muted); font-size: 0.82rem; }
+
+    /* ===================== 帖子配图 ===================== */
+    .compose-images {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6rem;
+      margin: -0.2rem 0 1rem;
+    }
+
+    .compose-image {
+      position: relative;
+      width: 96px;
+      height: 96px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #04122b;
+      overflow: hidden;
+    }
+
+    .compose-image img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .compose-image button {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      width: 22px;
+      height: 22px;
+      padding: 0;
+      border: 0;
+      border-radius: 50%;
+      background: rgba(239, 68, 68, 0.92);
+      color: #fff;
+      font-size: 0.8rem;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    .thread-images {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 0.6rem;
+      margin-top: 1rem;
+    }
+
+    .thread-images:empty { display: none; }
+
+    .thread-image {
+      aspect-ratio: 1 / 1;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #04122b;
+      overflow: hidden;
+    }
+
+    .thread-image img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      cursor: zoom-in;
+    }
+
+    /* ===================== 小屏 ===================== */
+    @media (max-width: 640px) {
+      .wrap { width: calc(100% - 1.4rem); }
+      .brand { width: 82px; height: 82px; }
+      .brand-fallback { font-size: 1.5rem; }
+      .panel-pad { padding: 1.15rem; }
+      .media-grid { grid-template-columns: 1fr; }
+      .input-search { width: 100%; }
+      .section-tools { width: 100%; }
+      .about-list > div { grid-template-columns: 4.6rem 1fr; }
+      .dialog-body { padding: 0.4rem; }
+      .hero { grid-template-columns: 1fr; gap: 1rem; padding: 1rem; }
+      .campus-strip { grid-template-columns: 1fr; }
+      .campus-strip img { aspect-ratio: 16 / 10; }
+      .forum-row { grid-template-columns: minmax(0, 1fr); gap: 0.3rem; padding: 0.75rem 0.85rem; }
+      .forum-row-meta,
+      .forum-row-stats { justify-content: flex-start; text-align: left; }
+      .form-grid { grid-template-columns: 1fr; }
+      .hot-grid { grid-template-columns: 1fr; }
+      .hot-media { grid-template-columns: repeat(3, 1fr); }
+      .thread-images { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap">
+      <div class="brand" id="brand">
+        <img class="brand-logo" id="brandLogo" src="/logo.png?v=2" alt="">
+        <span class="brand-fallback" aria-hidden="true">35</span>
+      </div>
+      <h1 class="site-title">三十五中学生网</h1>
+      <p class="site-subtitle">学生作品展示 · 内容经管理员审核后公开</p>
+    </div>
+  </header>
+
+  <nav class="site-nav" aria-label="主导航">
+    <div class="wrap">
+      <a class="nav-link" href="#home" data-nav="home">首页</a>
+      <a class="nav-link" href="#upload" data-nav="upload">上传作品</a>
+      <a class="nav-link" href="#video" data-nav="video">视频库 <span class="nav-count" id="countPassed">0</span></a>
+      <a class="nav-link" href="#forum" data-nav="forum">论坛 <span class="nav-count" id="countForum">0</span></a>
+      <a class="nav-link" href="#audit" data-nav="audit">视频审核 <span class="nav-count" id="countPending">0</span></a>
+      <a class="nav-link" href="#about" data-nav="about">关于我们</a>
+    </div>
+  </nav>
+
+  <main class="site-main">
+    <div class="wrap">
+
+      <div class="alert" id="serverWarning" role="alert" hidden>
+        <strong>无法连接服务器</strong>
+        <span id="serverWarningText">请确认后端服务已启动（node server.js），然后刷新页面。</span>
+      </div>
+
+      <!-- ===================== 首页 ===================== -->
+      <section id="home" class="section active" aria-labelledby="homeTitle">
+        <div class="home-stack">
+
+          <div class="hero">
+            <div class="hero-media">
+              <img src="/img/school-gate.jpg?v=2" alt="哈尔滨市第三十五中学校校门" decoding="async">
+            </div>
+            <div class="hero-copy">
+              <p class="hero-kicker">哈尔滨市第三十五中学校</p>
+              <h2 class="hero-title">把作品和话题都留在这里</h2>
+              <p class="hero-text">作品上传后由管理员审核展示；论坛不用注册，填个昵称就能聊学习、社团和日常。</p>
+              <div class="hero-actions">
+                <a class="btn btn-primary" href="#forum">进入论坛</a>
+                <a class="btn btn-ghost" href="#video">看看作品库</a>
+              </div>
+            </div>
+          </div>
+
+          <div class="campus-strip">
+            <figure>
+              <img src="/img/school-march.jpg?v=2" alt="升旗仪式" loading="lazy" decoding="async">
+              <figcaption>升旗仪式 · 操场</figcaption>
+            </figure>
+          </div>
+
+<section class="hot" aria-labelledby="hotTitle">
+            <div class="hot-head">
+              <h2 class="hot-title" id="hotTitle">今日热点</h2>
+              <span class="hot-sub">论坛热帖与作品，由管理员确认后展示</span>
+            </div>
+            <div class="hot-grid">
+              <div class="hot-card">
+                <h3 class="hot-card-title">论坛热帖</h3>
+                <ul class="hot-list" id="hotThreads"></ul>
+              </div>
+              <div class="hot-card">
+                <h3 class="hot-card-title">作品精选</h3>
+                <div class="hot-media" id="hotItems"></div>
+              </div>
+            </div>
+          </section>
+
+          <div class="hero-actions" style="margin-bottom:1.2rem">
+            <a class="btn btn-primary" href="#upload">去上传作品</a>
+            <a class="btn btn-ghost" href="#forum">去论坛发帖</a>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ===================== 上传作品 ===================== -->
+      <section id="upload" class="section" aria-labelledby="uploadTitle">
+        <div class="home-stack">
+          <div class="panel panel-pad">
+            <h2 class="panel-title" id="uploadTitle">上传节目 / 封面</h2>
+            <p class="panel-hint">支持图片（≤ 20MB）与视频（≤ 500MB），可一次选择多个文件；提交后进入待审核状态，管理员通过后才会公开。</p>
+
+            <label class="field" for="authorInput">
+              <span class="field-label">作者姓名（必填）</span>
+              <input id="authorInput" class="input" type="text" maxlength="24" autocomplete="name" placeholder="请输入你的名字">
+            </label>
+
+            <div id="dropZone" class="dropzone" role="button" tabindex="0" aria-label="点击选择文件，或把图片、视频拖放到此位">
+              <div class="dropzone-icon" aria-hidden="true">＋</div>
+              <p class="dropzone-text">把文件拖到这里，或 <span class="link">点击选择文件</span></p>
+              <p class="dropzone-hint">图片 / 视频 · 支持多选</p>
+              <input id="fileInput" type="file" accept="image/*,video/*" multiple hidden>
+            </div>
+
+            <div id="previewList" class="preview-list"></div>
+
+            <div class="form-actions">
+              <button id="uploadBtn" class="btn btn-primary" type="button" disabled>提交审核</button>
+              <button id="clearPendingBtn" class="btn btn-ghost" type="button">清空选择</button>
+              <span class="form-note" id="pendingNote"></span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 视频库 ===================== -->
+      <section id="video" class="section" aria-labelledby="videoTitle">
+        <div class="section-head">
+          <h2 class="section-title" id="videoTitle">已通过节目库</h2>
+          <div class="section-tools">
+            <input id="searchInput" class="input input-search" type="search" placeholder="搜索作品或作者…" aria-label="搜索作品或作者">
+            <button id="clearLibraryBtn" class="btn btn-danger btn-sm" type="button">清空库</button>
+          </div>
+        </div>
+        <p class="section-hint" id="libraryHint">共 0 个作品</p>
+        <div id="programGrid" class="media-grid"></div>
+      </section>
+
+      <!-- ===================== 论坛 ===================== -->
+      <section id="forum" class="section" aria-labelledby="forumTitle">
+        <div class="section-head">
+          <h2 class="section-title" id="forumTitle">校园论坛</h2>
+          <div class="section-tools">
+            <button id="newThreadBtn" class="btn btn-primary btn-sm" type="button">发帖</button>
+            <button id="refreshForumBtn" class="btn btn-ghost btn-sm" type="button">刷新</button>
+          </div>
+        </div>
+        <p class="section-hint" id="forumHint">不用注册，填个昵称就能发言；请遵守免责声明里的约定。</p>
+
+        <div id="forumBoard">
+          <div class="forum-tabs" id="forumTabs" role="tablist" aria-label="论坛板块"></div>
+          <div class="forum-list" id="forumList"></div>
+          <div class="forum-pager" id="forumPager"></div>
+        </div>
+
+        <div id="forumCompose" class="panel panel-pad" hidden>
+          <h3 class="panel-title">发布新帖</h3>
+          <div class="form-grid">
+            <label class="field" for="threadAuthor">
+              <span class="field-label">昵称</span>
+              <input id="threadAuthor" class="input" type="text" maxlength="24" placeholder="例如：高二(3)班 小明">
+            </label>
+            <label class="field" for="threadCategory">
+              <span class="field-label">板块</span>
+              <select id="threadCategory" class="input">
+                <option value="campus">校园生活</option>
+                <option value="study">学习交流</option>
+                <option value="club">社团活动</option>
+                <option value="feedback">意见建议</option>
+              </select>
+            </label>
+          </div>
+          <label class="field" for="threadTitle">
+            <span class="field-label">标题（1–60 字，必填）</span>
+            <input id="threadTitle" class="input" type="text" maxlength="60" placeholder="一句话说清你要聊什么">
+          </label>
+          <label class="field" for="threadContent">
+            <span class="field-label">内容（10–5000 字）</span>
+            <textarea id="threadContent" class="input" rows="6" maxlength="5000" placeholder="正文…"></textarea>
+          </label>
+          <label class="field" for="threadImageInput">
+            <span class="field-label">配图（可选，最多 3 张，单张 ≤ 8MB）</span>
+            <input id="threadImageInput" class="input" type="file" accept="image/*" multiple>
+          </label>
+          <div id="threadImagePreview" class="compose-images"></div>
+          <div class="form-actions">
+            <button id="submitThreadBtn" class="btn btn-primary" type="button">发布</button>
+            <button id="cancelThreadBtn" class="btn btn-ghost" type="button">取消</button>
+            <span class="form-note" id="threadNote"></span>
+          </div>
+        </div>
+
+        <div id="forumDetail" hidden>
+          <button id="backToForumBtn" class="btn btn-ghost btn-sm" type="button">← 返回列表</button>
+          <article class="thread">
+            <h3 class="thread-title" id="threadDetailTitle"></h3>
+            <p class="thread-meta" id="threadDetailMeta"></p>
+            <div class="thread-body" id="threadDetailBody"></div>
+            <div class="thread-images" id="threadImages"></div>
+            <div class="thread-tools" id="threadTools" hidden></div>
+          </article>
+
+          <div class="reply-list" id="replyList"></div>
+
+          <div class="panel panel-pad">
+            <h4 class="panel-title">回复</h4>
+            <label class="field" for="replyAuthor">
+              <span class="field-label">昵称</span>
+              <input id="replyAuthor" class="input" type="text" maxlength="24" placeholder="昵称">
+            </label>
+            <label class="field" for="replyContent">
+              <span class="field-label">内容（2–2000 字）</span>
+              <textarea id="replyContent" class="input" rows="4" maxlength="2000" placeholder="说点什么…"></textarea>
+            </label>
+            <div class="form-actions">
+              <button id="submitReplyBtn" class="btn btn-primary" type="button">发表回复</button>
+              <span class="form-note" id="replyNote"></span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 审核 ===================== -->
+      <section id="audit" class="section" aria-labelledby="auditTitle">
+        <div class="section-head">
+          <h2 class="section-title" id="auditTitle">视频审核</h2>
+          <div class="section-tools">
+            <button id="showAuditBtn" class="btn btn-warn btn-sm" type="button">进入管理员审核</button>
+            <button id="logoutBtn" class="btn btn-ghost btn-sm" type="button" hidden>退出管理员</button>
+          </div>
+        </div>
+
+        <div id="auditLocked" class="locked">
+          <p>审核区需要管理员密码，点击「进入管理员审核」解锁。</p>
+        </div>
+
+        <div id="auditPanel" hidden>
+          <p class="section-hint">
+            <span id="auditHint">待审核 0 个</span>
+            <span id="storageNote"></span>
+          </p>
+          <div id="auditGrid" class="media-grid"></div>
+        </div>
+      </section>
+
+      <!-- ===================== 关于 ===================== -->
+      <section id="about" class="section" aria-labelledby="aboutTitle">
+        <div class="panel panel-pad about">
+          <h2 class="panel-title" id="aboutTitle">关于我们</h2>
+
+          <details class="notice" open>
+            <summary>⚠️ 安全免责声明（请务必阅读）</summary>
+            <div class="notice-body">
+              <p>1. 本平台仅用于校内学生作品展示，所有上传内容必须为原创或已获得合法授权。</p>
+              <p>2. 严禁上传涉及色情、暴力、违法、谣言、隐私、版权侵权的任何内容，违者自行承担全部法律责任。</p>
+              <p>3. 用户上传的所有内容将进入管理员审核流程，审核通过后方可公开显示，平台有权拒绝或删除任何违规内容。</p>
+              <p>4. 平台不保证服务不间断，不承担因网络、设备、系统故障等不可抗力导致的数据损失。</p>
+              <p>5. 任何因使用本平台产生的纠纷，由内容上传者承担全部责任，与平台及管理员无关。</p>
+              <p>6. 内容一经上传，即表示用户已阅读、理解并同意本声明全部条款。</p>
+              <p class="notice-contact">负责人：赵明锐 · 邮箱：<a href="mailto:ZhaoMingrui@outlook.com">ZhaoMingrui@outlook.com</a></p>
+            </div>
+          </details>
+
+          <p>三十五中学生网 · 内容审核版，用于校内学生作品展示。</p>
+          <dl class="about-list">
+            <div><dt>负责人</dt><dd>赵明锐</dd></div>
+            <div><dt>邮箱</dt><dd><a href="mailto:ZhaoMingrui@outlook.com">ZhaoMingrui@outlook.com</a></dd></div>
+            <div><dt>局域网地址</dt><dd id="lanUrls">—</dd></div>
+            <div><dt>数据存储</dt><dd>作品文件保存在本机服务器的 data/ 目录，页面通过 /api 接口读写</dd></div>
+            <div><dt>版本</dt><dd>v3 · 服务端版</dd></div>
+          </dl>
+          <p class="about-note">
+            提示：本页面是纯静态前端演示。管理员密码只用于防止误操作，不能等同于真实权限控制——
+            任何人打开开发者工具都能绕过。正式上线请接入后端接口、账号登录与服务端鉴权。
+          </p>
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <p>三十五中学生网 · 内容审核版</p>
+      <p>负责人：赵明锐 · ZhaoMingrui@outlook.com</p>
+    </div>
+  </footer>
+
+  <dialog class="media-dialog" id="mediaDialog" aria-label="作品预览">
+    <div class="dialog-head">
+      <p class="dialog-title" id="dialogTitle"></p>
+      <button class="dialog-close" id="dialogClose" type="button" aria-label="关闭预览">✕</button>
+    </div>
+    <div class="dialog-body" id="dialogBody"></div>
+  </dialog>
+
+  <div class="toast-root" id="toastRoot" aria-live="polite"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
